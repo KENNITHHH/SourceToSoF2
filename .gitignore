@@ -1,0 +1,17 @@
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+
+# Tool output
+SourceToSoF2.txt
+*.pk3
+*.bsp
+*.map
+*.srf
+*.prt
+*.lin
