@@ -8,6 +8,12 @@ sounds. One window, ten steps, one button.
 Tested on Counter-Strike: Source maps and CS:GO maps decompiled to `.vmf`
 (de_dust2, de_cache, de_overpass, de_mirage, de_cbble), for SoF2 MP 1.03.
 
+### [Download SourceToSoF2.exe](https://github.com/KENNITHHH/sourcetosof2/releases)
+
+One file, nothing to install. Windows 10/11 64-bit.
+
+![SourceToSoF2](docs/screenshot.png)
+
 ---
 
 ## What you need
