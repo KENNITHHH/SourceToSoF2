@@ -83,6 +83,7 @@ to stderr at the end of the run so you know what needs manual attention.
 import argparse
 import json
 import glob
+import hashlib
 import math
 import re
 import os
@@ -849,6 +850,103 @@ def _md3_path(md3_dir, model):
     return os.path.join(md3_dir, *rel.split('/'))
 
 
+_KV_BLOCK_RE = re.compile(r'\{\n((?:"[^"\n]*" "[^"\n]*"\n)+)\}')
+
+
+def unshadow_light_fixtures(map_text, md3_dir):
+    """Let the light out of lanterns and lamps.
+
+    Source maps hang a light entity INSIDE the prop that shows it - de_cbble's
+    12 it_lantern1 placements each carry two (24 of the map's 35 lights). VRAD
+    lights the room around them. q3map2 does not: a baked misc_model is solid
+    to light like any wall, so a light inside one lights the inside of the
+    lantern and nothing else (frame and glass both block - the glass shader is
+    opaque). On de_cbble that left the lantern-lit archways and the rooms
+    around them several times darker than CS:S.
+
+    misc_model's own "_castShadows" "0" (q3map2) is exactly the fix: the model
+    is still lit like any baked prop, it just doesn't stop light. It is set
+    only on models that have a light entity inside their bounds, so every
+    other prop keeps casting its shadow. Returns (map_text, count).
+    """
+    LIT_SHADER_TARGETS.clear()
+    lights = []
+    for m in _KV_BLOCK_RE.finditer(map_text):
+        kv = dict(re.findall(r'"([^"\n]*)" "([^"\n]*)"', m.group(1)))
+        if kv.get('classname', '').lower().startswith('light') and 'origin' in kv:
+            try:
+                lights.append(tuple(float(v) for v in kv['origin'].split()))
+            except ValueError:
+                pass
+    if not lights:
+        return map_text, 0
+    bounds_cache = {}
+
+    def bounds(model):
+        if model not in bounds_cache:
+            b = None
+            d = _md3_read(_md3_path(md3_dir, model))
+            if d is not None and d[:4] == b'IDP3':
+                ofr = struct.unpack_from('<i', d, 92)[0]
+                if ofr + 24 <= len(d):
+                    f = struct.unpack_from('<6f', d, ofr)
+                    b = (f[0:3], f[3:6])
+            bounds_cache[model] = b
+        return bounds_cache[model]
+
+    out, pos, n = [], 0, 0
+    for m in _KV_BLOCK_RE.finditer(map_text):
+        body = m.group(1)
+        kv = dict(re.findall(r'"([^"\n]*)" "([^"\n]*)"', body))
+        if kv.get('classname', '').lower() != 'misc_model' or '_castShadows' in kv:
+            continue
+        b = bounds(kv.get('model', ''))
+        if b is None:
+            continue
+        try:
+            o = tuple(float(v) for v in kv.get('origin', '0 0 0').split())
+            if 'angles' in kv:
+                ang = tuple(float(v) for v in kv['angles'].split())
+            else:
+                ang = (0.0, float(kv.get('angle', 0) or 0), 0.0)
+            sc = float(kv.get('modelscale', 1) or 1)
+        except ValueError:
+            continue
+        ax = _q3_axis(ang)
+        (mn, mx) = b
+        hit = False
+        for lp in lights:
+            dv = (lp[0] - o[0], lp[1] - o[1], lp[2] - o[2])
+            if max(abs(dv[0]), abs(dv[1]), abs(dv[2])) > 4096:
+                continue
+            loc = [sum(dv[i] * ax[k][i] for i in range(3)) / sc for k in range(3)]
+            if all(mn[k] - 1.0 <= loc[k] <= mx[k] + 1.0 for k in range(3)):
+                hit = True
+                break
+        if not hit:
+            continue
+        extra = ['"_castShadows" "0"\n']
+        # The lit look: a prop with its light inside reads as glowing in CS:S
+        # because Source lights a prop at runtime from where it stands - right
+        # next to its own light. Baked here, its panes face away from that light
+        # and stay dark. Each of its shaders is remapped to a <name>_lit copy;
+        # vmt2shader.py --lit-shaders adds a glow stage to the glass ones and
+        # leaves the rest (the iron frame) as plain copies. Skipped when the
+        # placement already remaps its shaders (out of a water fog).
+        if not any(k.lower().startswith('_remap') for k in kv):
+            for k, nm in enumerate(_md3_shader_names(_md3_path(md3_dir, kv.get('model', '')))):
+                base = re.sub(r'\.(tga|jpg|jpeg|png)$', '', nm, flags=re.I)
+                target = short_qpath(base + '_lit')
+                LIT_SHADER_TARGETS[nm] = target
+                extra.append('"_remap{}" "{};{}"\n'.format(k + 1, nm, target))
+        out.append(map_text[pos:m.end(1)])
+        out.extend(extra)
+        pos = m.end(1)
+        n += 1
+    out.append(map_text[pos:])
+    return ''.join(out), n
+
+
 _MODEL_STATIC_BLOCK_RE = re.compile(
     r'\{\n"classname" "model_static"\n((?:"[^"\n]*" "[^"\n]*"\n)*)\}')
 
@@ -910,6 +1008,189 @@ def _unnetwork_excess_statics(map_text, md3_dir, model_scale):
 # water in Source would tint it.
 PROP_FOG_INSIDE_FRACTION = 0.5
 NOFOG_SHADER_TARGETS = {}      # md3 shader name -> remap target (vmt2shader adds <target>_bsp)
+LIT_SHADER_TARGETS = {}        # md3 shader name -> its _lit copy, for props with a light inside
+
+
+# --- Texture lights (lights.rad) ---------------------------------------------
+#
+# Source lights some rooms with no light entity at all: a texture listed in
+# lights.rad (fluorescent tubes, emergency lamps, light panels) makes VRAD
+# turn every face carrying it into an area light - texinfo flag SURF_LIGHT -
+# and draws the face itself fullbright (SURF_NOLIGHT, no lightmap). Nothing in
+# the .vmf says so; the light only exists in the compiled .bsp. On de_cbble
+# the room under the fluorescent tubes (-1800..-1072, -1024) gets ALL of its
+# light that way: Valve's lightmap there is 0.220 where the tubes' direct
+# light predicts 0.215, and the point lights add 0.003.
+#
+# VRAD writes each emitting patch to the worldlights lump (15, or 54 in an
+# HDR-only map) as emit_surface: intensity I, falloff I * cos_emit * cos_recv
+# / d^2. A point light is stored as linear * 10000/255 with falloff 1/d^2
+# (measured: every light on de_cbble has exactly that ratio), so on its axis a
+# patch of intensity I is a point light of linear I * 255/10000.
+#
+# q3map2 has the same emitter: q3map_surfacelight S on a shader is a
+# Lambertian area light. Measured with this q3map2 (-game sof2 -filter
+# -samples 2, the compile .bat's flags): floor = 0.237 * S * area / d^2, with
+# the cos^2 off-axis falloff; a point light gives 7500 * light / d^2. Matching
+# point_light_value's scale (k * linear * (100 * scale)^2 / 7500) then gives
+#     S = k * R * 255 / 0.237,   R = VRAD intensity per Source unit^2,
+# with the map scale cancelling out. R comes from the .bsp per texture (sum of
+# its patches over the area of its SURF_LIGHT faces).
+#
+# k is solved per map, so the emitting shader cannot be the texture's shared
+# one (shared shaders must be identical across maps). The faces get a copy
+# named after its own contents - <texture>_emit<hash of value + colour> - so
+# two maps that need the same light share one identical shader, and maps that
+# need different ones never collide. vmt2shader.py writes the copies from
+# <map>_texlights.json.
+SURF_LIGHT = 0x1
+Q3_AREA_LIGHT_RESPONSE = 0.237
+VRAD_POINT_INTENSITY_SCALE = 10000.0 / 255.0
+# A texture light below this many lightmap bytes at 64 map units from its
+# biggest face is left alone (de_cbble's +0~white lantern bulbs: ~0.01).
+TEXLIGHT_MIN_BYTES_AT_64 = 0.5
+TEXLIGHT_SHADERS = {}          # emitting copy (textures/...) -> {base, surfacelight, rgb}
+
+
+def _vbsp_lump(data, index):
+    off, length, _ver, _cc = struct.unpack_from('<iiii', data, 8 + 16 * index)
+    if length <= 0 or off < 0 or off + length > len(data):
+        return b''
+    blob = data[off:off + length]
+    return b'' if blob[:4] == b'LZMA' else blob
+
+
+def read_source_texlights(bsp_path):
+    """{texture (lowercase): {'R': [r, g, b] intensity per unit^2, 'area': biggest
+    face area, 'faces': n}} for the texture lights VRAD baked into a Source .bsp,
+    plus a note. Empty when the .bsp has none or cannot be read."""
+    try:
+        with open(bsp_path, 'rb') as f:
+            data = f.read()
+    except OSError as e:
+        return {}, "could not read {}: {}".format(bsp_path, e)
+    if data[:4] != b'VBSP':
+        return {}, "{} is not a Source .bsp".format(os.path.basename(bsp_path))
+    wl = _vbsp_lump(data, 15) or _vbsp_lump(data, 54)
+    faces = _vbsp_lump(data, 7) or _vbsp_lump(data, 58)
+    texdata, strdata, strtab = _vbsp_lump(data, 2), _vbsp_lump(data, 43), _vbsp_lump(data, 44)
+    texinfo = _vbsp_lump(data, 6)
+    verts, edges, surfedges = _vbsp_lump(data, 3), _vbsp_lump(data, 12), _vbsp_lump(data, 13)
+    if not wl or len(wl) % 88:
+        return {}, "no readable worldlights lump"
+    if not (faces and texdata and strtab and texinfo and verts and edges and surfedges):
+        return {}, "face lumps missing or compressed"
+    offs = struct.unpack_from('<%di' % (len(strtab) // 4), strtab)
+    names = []
+    for i in range(len(texdata) // 32):
+        nid = struct.unpack_from('<i', texdata, i * 32 + 12)[0]
+        s = strdata[offs[nid]:] if 0 <= nid < len(offs) else b''
+        names.append(s[:s.find(b'\0')].decode('latin-1').lower() if b'\0' in s else '')
+    n_ti = len(texinfo) // 72
+    V = [struct.unpack_from('<3f', verts, i * 12) for i in range(len(verts) // 12)]
+    E = [struct.unpack_from('<2H', edges, i * 4) for i in range(len(edges) // 4)]
+    SE = struct.unpack_from('<%di' % (len(surfedges) // 4), surfedges)
+    lit_faces = []                 # (points, unit normal, area, texture)
+    for i in range(len(faces) // 56):
+        fe, ne, ti, disp = struct.unpack_from('<ihhh', faces, i * 56 + 4)
+        if not (0 <= ti < n_ti) or disp != -1 or ne < 3:
+            continue
+        flags, tdi = struct.unpack_from('<ii', texinfo, ti * 72 + 64)
+        if not (flags & SURF_LIGHT) or not (0 <= tdi < len(names)):
+            continue
+        try:
+            pts = [V[E[abs(SE[fe + k])][0 if SE[fe + k] >= 0 else 1]] for k in range(ne)]
+        except IndexError:
+            continue
+        acc = [0.0, 0.0, 0.0]
+        for k in range(1, ne - 1):
+            acc = add(acc, cross(sub(pts[k], pts[0]), sub(pts[k + 1], pts[0])))
+        two_a = length(acc)
+        if two_a < 1e-6:
+            continue
+        lit_faces.append((pts, scale_vec(acc, 1.0 / two_a), 0.5 * two_a, names[tdi]))
+    if not lit_faces:
+        return {}, "no SURF_LIGHT faces"
+
+    def owner(o, n):
+        best = None
+        for pts, fn, area, tex in lit_faces:
+            if abs(dot(fn, n)) < 0.99 or abs(dot(fn, sub(o, pts[0]))) > 2.0:
+                continue
+            if point_in_polygon_3d(o, pts, fn) and (best is None or area < best[0]):
+                best = (area, tex)
+        return best[1] if best else None
+
+    out = {}
+    for pts, fn, area, tex in lit_faces:
+        rec = out.setdefault(tex, {'I': [0.0, 0.0, 0.0], 'total_area': 0.0, 'area': 0.0, 'faces': 0})
+        rec['total_area'] += area
+        rec['area'] = max(rec['area'], area)
+        rec['faces'] += 1
+    unmatched = other_style = 0
+    for i in range(len(wl) // 88):
+        f = struct.unpack_from('<9f3i7f3i', wl, i * 88)
+        if f[10] != 0:              # emit_surface only
+            continue
+        if f[11] != 0:              # a switchable light style: not in the base lightmap
+            other_style += 1
+            continue
+        tex = owner(f[0:3], f[6:9])
+        if tex is None:
+            unmatched += 1
+            continue
+        out[tex]['I'] = add(out[tex]['I'], f[3:6])
+    result = {}
+    for tex, rec in out.items():
+        if max(rec['I']) <= 0:
+            continue
+        result[tex] = {'R': [c / rec['total_area'] for c in rec['I']],
+                       'area': rec['area'], 'faces': rec['faces']}
+    note = ""
+    if unmatched or other_style:
+        note = "{} patch(es) on no SURF_LIGHT face, {} on a switchable style - left out".format(
+            unmatched, other_style)
+    return result, note
+
+
+def texlight_surfacelight(R):
+    """(q3map_surfacelight value, normalised colour) for VRAD intensity per unit^2."""
+    peak = max(R)
+    s = EXPOSURE_K[0] * POINT_LIGHT_SCALE[0] * peak * 255.0 / Q3_AREA_LIGHT_RESPONSE
+    return s, [c / peak for c in R]
+
+
+def emit_texture_lights(map_text, texlights, scale):
+    """Retexture the faces of the map's texture lights to their emitting copy
+    (see the note above). Returns (map text, report lines)."""
+    TEXLIGHT_SHADERS.clear()
+    rename, report = {}, []
+    for tex, rec in sorted(texlights.items()):
+        s, rgb = texlight_surfacelight(rec['R'])
+        at64 = Q3_AREA_LIGHT_RESPONSE * s * rec['area'] * scale * scale / (64.0 * 64.0)
+        if at64 < TEXLIGHT_MIN_BYTES_AT_64:
+            report.append("{}: too faint to matter ({:.2f} lightmap bytes at 64 units), left as "
+                          "it is".format(tex, at64))
+            continue
+        spec = "{:.0f} {:.3f} {:.3f} {:.3f}".format(s, *rgb)
+        tag = hashlib.md5(spec.encode('ascii')).hexdigest()[:6]
+        new = short_qpath(tex + '_emit' + tag)
+        rename[tex] = new
+        TEXLIGHT_SHADERS['textures/' + new] = {
+            'base': 'textures/' + tex, 'surfacelight': round(s), 'rgb': [round(c, 3) for c in rgb]}
+        report.append("{} -> {}: q3map_surfacelight {:.0f}, colour {:.2f} {:.2f} {:.2f} "
+                      "({} face(s) in Source)".format(tex, new, s, rgb[0], rgb[1], rgb[2], rec['faces']))
+    if not rename:
+        return map_text, report
+    out, n = [], 0
+    for ln in map_text.split('\n'):
+        m = _BRUSH_FACE_TEX_RE.match(ln)
+        if m and m.group(2).lower() in rename:
+            ln = m.group(1) + rename[m.group(2).lower()] + m.group(3)
+            n += 1
+        out.append(ln)
+    report.append("{} brush face(s) retextured to their emitting copy".format(n))
+    return '\n'.join(out), report
 
 
 def _md3_shader_names(path):
@@ -2379,6 +2660,19 @@ def worldize_skybox_models(root, warnings, main_bounds=None, map_scale=1.0):
     root['entity'] = new_entities
     if outside:
         counts = Counter(outside)
+        # A real 3D skybox holds a handful of backdrop models. Dozens means the
+        # skybox area was drawn too wide and swallowed the map (see
+        # setup_skybox_area): on de_cbble the 4096-unit sphere fallback took
+        # 138 props, among them the window and door frames of the east side.
+        if len(outside) > SKYBOX_OUTSIDE_ALARM:
+            warnings.append(
+                "!! {} prop(s) were left out as 3D-skybox content - far more than a 3D skybox "
+                "normally holds, so the skybox area is probably reaching into the playable map "
+                "and these are REAL PROPS that will be missing in game (windows, doors, "
+                "railings and the like). The skybox area used was: {}. Check the '3D skybox "
+                "area' note above: if it says the sealed-room flood escaped and a sphere was "
+                "used, lower --skybox-radius until this count matches what the 3D skybox really "
+                "holds.".format(len(outside), SKYBOX_AREA_INFO[0] or "(unknown)"))
         warnings.append(
             "--skybox-models-to-world: left out {} 3D-skybox prop(s) that land outside the playable "
             "map at real scale (playable area x {:.0f}..{:.0f}, y {:.0f}..{:.0f}, z {:.0f}..{:.0f}). "
@@ -2526,10 +2820,48 @@ def _segment_hits_brush(a, b, planes, eps=0.01):
     return t1 - t0 > 1e-6
 
 
-def find_skybox_area(root):
+PLAYER_SPAWN_CLASSES = (
+    'info_player_terrorist', 'info_player_counterterrorist', 'info_player_start',
+    'info_player_deathmatch', 'info_deathmatch_spawn', 'info_player_rebel',
+    'info_player_combine', 'info_player_allies', 'info_player_axis',
+)
+
+
+def find_player_spawns(root):
+    out = []
+    for entity in root.get('entity', []):
+        if get1(entity, 'classname', '').strip().lower() in PLAYER_SPAWN_CLASSES:
+            o = get1(entity, 'origin')
+            if o:
+                try:
+                    v = [float(x) for x in o.split()]
+                except ValueError:
+                    continue
+                if len(v) == 3:
+                    out.append(tuple(v))
+    return out
+
+
+def find_playable_area(root):
+    """-> (mins, maxs) of the sealed space the players stand in.
+
+    The 3D skybox is whatever is NOT this. Source will not compile a map whose
+    playable space leaks, so a flood from a player spawn is reliable where a
+    flood from the sky_camera is not: de_cbble's skybox room is open to the
+    outside, so the camera's flood escapes, but its playable map is sealed.
+    Used to keep the --skybox-radius sphere from reaching into the real map.
+    """
+    seeds = find_player_spawns(root)
+    if not seeds:
+        return None
+    return find_skybox_area(root, seeds=seeds)
+
+
+def find_skybox_area(root, seeds=None):
     """-> (mins, maxs) of the sealed room around the sky_camera, Source units,
-    or None (no sky_camera, or the flood leaked)."""
-    cam = find_sky_camera_origin(root)
+    or None (no sky_camera, or the flood leaked). With `seeds`, floods from
+    those points instead (see find_playable_area)."""
+    cam = seeds[0] if seeds else find_sky_camera_origin(root)
     if cam is None:
         return None
     blockers = []
@@ -2581,11 +2913,18 @@ def find_skybox_area(root):
                     return True
         return False
 
-    start = (0, 0, 0)
-    visited = {start}
-    stack = [start]
-    lo = list(centre(start))
-    hi = list(centre(start))
+    starts = [(0, 0, 0)]
+    if seeds:
+        for s in seeds[1:]:
+            starts.append(tuple(int(round((s[a] - cam[a]) / C)) for a in range(3)))
+    visited = set(starts)
+    stack = list(starts)
+    lo = list(centre(starts[0]))
+    hi = list(centre(starts[0]))
+    for s in starts:
+        p = centre(s)
+        for a in range(3):
+            lo[a] = min(lo[a], p[a]); hi[a] = max(hi[a], p[a])
     steps = ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1))
     while stack:
         c = stack.pop()
@@ -2610,6 +2949,102 @@ def find_skybox_area(root):
     return (tuple(v - C for v in lo), tuple(v + C for v in hi))
 
 
+# When the flood escapes (an unsealed skybox room, or one whose walls do not
+# close in the VMF), the old fallback was the 4096-unit sphere - and that is
+# exactly what it was meant to replace. On de_cbble the sky_camera sits at
+# (3072 0 0) while the playable map runs to x 1792, only ~1280 away, so the
+# sphere swallowed the whole east side: 138 real props (22 window arches, 17
+# double windows, 15 single windows, 3 door arches, cinderblocks, shrubs,
+# barrels, benches) were treated as 3D-skybox props, scaled to real scale,
+# landed outside the playable map and were left out, and real displacements
+# were rebuilt as coarse skybox landscape prisms.
+#
+# A 3D skybox is always built as its own little diorama, set well away from the
+# map, so a gap-based clustering separates it even when nothing seals it. The
+# brushes are grouped by whether their bounding boxes (grown by half the gap)
+# touch through a chain of others; the group holding the sky_camera is the
+# skybox. It is only believed when it is a minority of the map's brushes - a
+# cluster holding most of them means the skybox and the map are joined, and
+# the sphere is the last resort.
+SKYBOX_OUTSIDE_ALARM = 24      # more left-out props than this means the area is wrong
+SKYBOX_CLUSTER_GAP = 512.0
+SKYBOX_SHELL_MATERIAL = 'TOOLS/TOOLSSKYBOX'
+SKYBOX_CLUSTER_MAX_SHARE = 0.5
+
+
+def find_skybox_cluster(root, gap=SKYBOX_CLUSTER_GAP):
+    """-> (mins, maxs) of the brush cluster holding the sky_camera, or None."""
+    cam = find_sky_camera_origin(root)
+    if cam is None:
+        return None
+    boxes = []
+    for holder in list(root.get('world', [])) + list(root.get('entity', [])):
+        for solid in get_solid_blocks(holder):
+            mats = {(get1(s, 'material', '') or '').upper()
+                    for s in solid.get('side', []) if isinstance(s, dict)}
+            if not mats or mats <= _NONSOLID_TOOL_MATERIALS:
+                continue
+            # The sky shell is one hollow box drawn around BOTH the playable map
+            # and the 3D skybox (measured on de_cbble: 55 toolsskybox brushes
+            # spanning x -3712..4128, the whole world), so leaving it in bridges
+            # every cluster into one and nothing separates. The diorama's own
+            # brushes are what mark it out.
+            if SKYBOX_SHELL_MATERIAL in mats:
+                continue
+            pb = _brush_planes_and_bounds(solid)
+            if pb:
+                boxes.append((pb[1], pb[2]))
+    if len(boxes) < 2:
+        return None
+    parent = list(range(len(boxes)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    cell = max(gap, 1.0)
+    half = gap * 0.5
+    owner = {}
+    for i, (mn, mx) in enumerate(boxes):
+        lo = [int(math.floor((mn[a] - half) / cell)) for a in range(3)]
+        hi = [int(math.floor((mx[a] + half) / cell)) for a in range(3)]
+        if any(hi[a] - lo[a] > 512 for a in range(3)):
+            continue                     # a map-spanning brush joins nothing useful
+        for x in range(lo[0], hi[0] + 1):
+            for y in range(lo[1], hi[1] + 1):
+                for z in range(lo[2], hi[2] + 1):
+                    j = owner.setdefault((x, y, z), i)
+                    if j != i:
+                        ri, rj = find(i), find(j)
+                        if ri != rj:
+                            parent[ri] = rj
+    groups = {}
+    for i in range(len(boxes)):
+        groups.setdefault(find(i), []).append(i)
+    # the cluster whose bounds (grown by the gap) hold the sky_camera; if the
+    # camera sits in open space, the cluster nearest to it
+    best, best_d = None, None
+    for root_i, members in groups.items():
+        mn = tuple(min(boxes[i][0][a] for i in members) for a in range(3))
+        mx = tuple(max(boxes[i][1][a] for i in members) for a in range(3))
+        d = 0.0
+        for a in range(3):
+            d += max(mn[a] - half - cam[a], 0.0, cam[a] - mx[a] - half) ** 2
+        if best_d is None or d < best_d:
+            best, best_d = (members, mn, mx), d
+    if best is None:
+        return None
+    members, mn, mx = best
+    if len(members) > len(boxes) * SKYBOX_CLUSTER_MAX_SHARE:
+        return None                      # not a separate diorama
+    # grow by the join gap: the diorama's models sit a little outside its brushes
+    mn = tuple(v - half for v in mn)
+    mx = tuple(v + half for v in mx)
+    return (mn, mx), len(members), len(boxes)
+
+
 def setup_skybox_area(root, warnings, radius):
     area = find_skybox_area(root)
     SKYBOX_AREA[0] = area
@@ -2627,12 +3062,29 @@ def setup_skybox_area(root, warnings, radius):
             "skybox-related - --skybox-models-to-world, --skip-3d-skybox, skybox-marked props, "
             "overlays and terrain - uses this box.".format(cam[0], cam[1], cam[2], SKYBOX_AREA_INFO[0]))
     else:
-        SKYBOX_AREA_INFO[0] = "within {:g} units of the sky_camera".format(radius)
-        warnings.append(
-            "3D skybox area: could not find a sealed room around the sky_camera at ({:g} {:g} {:g}) "
-            "(the flood from it reached the outside of the map), so falling back to everything "
-            "within --skybox-radius {:g} of it. If playable content near the skybox gets treated "
-            "as skybox, lower --skybox-radius.".format(cam[0], cam[1], cam[2], radius))
+        clustered = find_skybox_cluster(root)
+        if clustered:
+            (mn, mx), n_in, n_all = clustered
+            SKYBOX_AREA[0] = (mn, mx)
+            SKYBOX_AREA_INFO[0] = "x {:.0f}..{:.0f}, y {:.0f}..{:.0f}, z {:.0f}..{:.0f}".format(
+                mn[0], mx[0], mn[1], mx[1], mn[2], mx[2])
+            warnings.append(
+                "3D skybox area: no sealed room around the sky_camera at ({:g} {:g} {:g}) - the "
+                "flood from it reached the outside of the map. Used the brush cluster the camera "
+                "stands in instead ({} of {} solid brushes, separated from the rest of the map by "
+                "at least {:g} units): {}. This replaces the old --skybox-radius sphere, which on "
+                "this kind of map reaches into the playable area and turns real props and terrain "
+                "into skybox.".format(cam[0], cam[1], cam[2], n_in, n_all,
+                                      SKYBOX_CLUSTER_GAP, SKYBOX_AREA_INFO[0]))
+        else:
+            SKYBOX_AREA_INFO[0] = "within {:g} units of the sky_camera".format(radius)
+            warnings.append(
+                "!! 3D skybox area: could not find a sealed room around the sky_camera at "
+                "({:g} {:g} {:g}), and the brushes around it are not a separate cluster either, so "
+                "this falls back to everything within --skybox-radius {:g} of it. THAT SPHERE CAN "
+                "REACH INTO THE PLAYABLE MAP: if props, windows, doors or terrain go missing near "
+                "the skybox, lower --skybox-radius until the count of left-out props below drops "
+                "to what the 3D skybox really holds.".format(cam[0], cam[1], cam[2], radius))
 
 
 def in_skybox_area(p):
@@ -4037,6 +4489,41 @@ LWO_STEEP_REPROJECT = False
 LWO_EDGE_TOL = 0.5
 
 
+# How far a mixed-power edge snap may slide a vertex WITHIN its own
+# displacement's plane, as a fraction of the neighbour's vertex spacing.
+#
+# The snap exists to close T-junction cracks: a higher-power displacement has
+# vertices between its lower-power neighbour's, and each is moved onto the
+# neighbour's displaced edge. Between two surfaces that really continue into
+# each other, that move is a small change in height. Measured on every snap
+# of five maps: de_dust2 and de_cache slide nothing (<= 0.01 of a cell),
+# de_mirage_cs2 at most 0.16.
+#
+# de_cbble is different. The 2040-unit south edge of its grass floor lies
+# along the 480-unit bottom edge of the grass bank's vertical front, and the
+# bank's foot is displaced up to 40 units back. Snapping dragged three floor
+# vertices 37-41 units into the floor's own interior (0.31-0.34 of a cell):
+# the floor's edge retreated from the curb, leaving a strip with no surface -
+# sky visible through it, bullets passing through, a dropped gun resting on
+# the collision brush below. Those two displacements don't meet; there is no
+# crack to close, so a snap that has to slide a surface's own edge that far
+# is refused and both keep their own edge.
+LWO_MAX_EDGE_SLIDE = 0.25
+
+
+def _edge_slide(arec, a_edge, before, after):
+    """Length of the part of a snap that moves a vertex within its own
+    displacement's flat plane (sideways), rather than along its normal."""
+    f00, f10, f01 = arec['flat'][0][0], arec['flat'][1][0], arec['flat'][0][1]
+    nrm = cross(sub(f10, f00), sub(f01, f00))
+    if length(nrm) < 1e-9:
+        return 0.0
+    nrm = normalize(nrm)
+    mv = sub(after, before)
+    in_plane = sub(mv, scale_vec(nrm, dot(mv, nrm)))
+    return length(in_plane)
+
+
 class LWOTerrainBuilder:
     """Collects every displacement in the map (as Source-exact records from
     compute_displacement_grid_lwo) and, in finalize_points, turns them into
@@ -4067,6 +4554,7 @@ class LWOTerrainBuilder:
         self.shader_triangles = {}
         self.total_vertex_adds = 0
         self.snapped_edge_verts = 0
+        self.refused_edge_snaps = 0
         self.split_triangles = 0
 
     def _flat_shader_name(self, nested_key):
@@ -4161,6 +4649,10 @@ class LWOTerrainBuilder:
                             p0 = brec['pos'][b_edge[k0][0]][b_edge[k0][1]]
                             p1 = brec['pos'][b_edge[k0 + 1][0]][b_edge[k0 + 1][1]]
                             snapped = lerp3(p0, p1, f)
+                            if _edge_slide(arec, a_edge, arec['pos'][vi][vj], snapped) > \
+                                    LWO_MAX_EDGE_SLIDE * length(seg) / (nb - 1):
+                                self.refused_edge_snaps += 1
+                                continue
                             arec['pos'][vi][vj] = snapped
                             self.snapped_edge_verts += 1
                             uv0 = brec['uv'][b_edge[k0][0]][b_edge[k0][1]]
@@ -6870,6 +7362,39 @@ def skylight_floor_response(iterations=SKYLIGHT_ITERATIONS):
     return total / count
 
 
+# --- Light headroom ------------------------------------------------------------
+#
+# q3map2 gives every entity and surface light its "Fast" flag (light.cpp:
+# LightFlags::DefaultQ3A, whatever the command line says) and then drops, luxel
+# by luxel, any contribution of <= 1.0 (on its 0-255 linear scale) before
+# -gamma. At -gamma 2.2 a dropped 1.0 would have shown as 20/255, so every
+# light ends in a hard cut instead of VRAD's soft tail. Measured with this
+# q3map2: a light whose floor should read 15.9 reads 0; at 21 and up it is
+# exact. On de_dust2 the tunnel lamps (brightness ~50) are cut off about 150
+# Source units out - their pools never reach the floor, which is why the
+# tunnels read 0.57-0.74 of CS:S while sunlit sand is at 0.94.
+#
+# The cure is exact, not a boost: every light (k) is made LIGHT_HEADROOM times
+# stronger, and the compile undoes it - -brightness X^(-1/G) after gamma for
+# lightmaps (gamma is a power, so (X*L)^(1/G) * X^(-1/G) = L^(1/G)),
+# -vertexscale 1/X and -gridscale / X before it for vertex light and the light
+# grid. Per-shader q3map_lightmapBrightness / q3map_vertexScale multiply those
+# defaults, so no shared shader changes. What stays cut is <= 1/X: at 16 that
+# is 6.5/255 after gamma, against 20 now (16 recovers 0.96 of the lost light
+# on de_dust2, 64 would give 1.00 for twice the light reach and compile time).
+LIGHT_HEADROOM = 16.0
+
+# The worldspawn "ambient" stood in for bounce light that q3map2 lost: until
+# LIGHT_HEADROOM, its cutoff dropped most of the bounce pass's dim diffuse
+# lights, so k * BOUNCE_FILL was added as a flat floor. With the headroom the
+# real bounce arrives and the floor counted twice: measured against Valve's
+# lightmaps (luxel by luxel, the fill taken back out), dim interiors on
+# de_dust2 went 1.46 -> 1.11 and dark corners 4.91 -> 2.11 with no fill at all,
+# sunlit and lamp-lit unchanged; de_cbble 1.33 -> 1.24 and 2.00 -> 1.55.
+# BOUNCE_FILL stays as the solve's anchor for Source's bounce level.
+AMBIENT_FILL = 0.0
+
+
 def solve_exposure(sun_rgb, sun_brightness, amb_rgb, amb_brightness, elevation):
     """Return the q3map2 values - and the -gamma to compile with - that put this
     light_environment on SOF2's screen as close to CS:S as SOF2 can show.
@@ -6909,7 +7434,8 @@ def solve_exposure(sun_rgb, sun_brightness, amb_rgb, amb_brightness, elevation):
         c = target / (m_sun ** p)
     gamma = SOURCE_GAMMA / p
     O = float(ENGINE_LIGHTMAP_OVERBRIGHT * SHADER_LIGHTMAP_SCALE)
-    k = (c / O) ** gamma           # q3map2 value = k * Source linear (255 units)
+    # q3map2 value = k * Source linear (255 units), with the light headroom in it
+    k = (c / O) ** gamma * LIGHT_HEADROOM
     s_peak = max(S + [1e-9])
     a_peak = max(A + [1e-9])
     screen = lambda lin255: min(max_m, c * (max(lin255, 0.0) / 255.0) ** (p / SOURCE_GAMMA))
@@ -6919,14 +7445,17 @@ def solve_exposure(sun_rgb, sun_brightness, amb_rgb, amb_brightness, elevation):
         # the light grid lights players and model_static props with SOF2's normal
         # 1x shaders, so it must not carry the shaders' 2x: scaling it up by
         # SHADER^gamma before gamma (q3map2 -gridscale) puts it back on 1x.
-        'grid_scale': round(float(SHADER_LIGHTMAP_SCALE) ** gamma, 2),
+        'grid_scale': round(float(SHADER_LIGHTMAP_SCALE) ** gamma / LIGHT_HEADROOM, 4),
+        # undo LIGHT_HEADROOM: after gamma for lightmaps, before it for vertices
+        'brightness': round(LIGHT_HEADROOM ** (-1.0 / gamma), 5),
+        'vertex_scale': round(1.0 / LIGHT_HEADROOM, 5),
         'curve_p': p,
         'exact': p >= 0.999 and c >= 0.999,
         'sun_intensity': k * s_peak,
         'sun_color': [x / s_peak for x in S],
         'skylight_value': k * a_peak / skylight_floor_response(),
         'sky_color': [x / a_peak for x in A],
-        'bounce_fill': k * a_peak * BOUNCE_FILL,
+        'bounce_fill': k * a_peak * BOUNCE_FILL * AMBIENT_FILL,
         # on-screen multipliers of the texture - same scale as the CS:S measurement
         'predicted': {
             'sunlit floor': screen(_luminance(S) * incidence + _luminance(A) * (1 + BOUNCE_FILL)),
@@ -10424,9 +10953,16 @@ def convert_vmf(text, texture_map, class_map, skip_classes, scale, recenter=Fals
             "Terrain (lwo mode): {} displacement(s) built at native power with Source's own "
             "triangulation; {} edge vertex(es) snapped onto lower-power neighbours and {} "
             "boundary triangle(s) split to match (Source's mixed-power edge handling, no "
-            "T-junctions).".format(len(LWO_TERRAIN_BUILDER.records),
+            "T-junctions).{}".format(len(LWO_TERRAIN_BUILDER.records),
                                    LWO_TERRAIN_BUILDER.snapped_edge_verts,
-                                   LWO_TERRAIN_BUILDER.split_triangles))
+                                   LWO_TERRAIN_BUILDER.split_triangles,
+                                   " {} more left as they were: snapping would have dragged the "
+                                   "displacement's own edge sideways by over a quarter of its "
+                                   "neighbour's vertex spacing, which means the two surfaces don't "
+                                   "actually meet there (LWO_MAX_EDGE_SLIDE) - snapping them opened a "
+                                   "see-through gap on de_cbble.".format(
+                                       LWO_TERRAIN_BUILDER.refused_edge_snaps)
+                                   if LWO_TERRAIN_BUILDER.refused_edge_snaps else ""))
 
         misc_model_lines = [
             "{",
@@ -10739,6 +11275,10 @@ def main():
                          "listed in the log. Default {:,} = a {:.0f} MB .bsp target (see "
                          "PROP_VERTEX_BUDGET); 0 = no limit.".format(
                              PROP_VERTEX_BUDGET, BSP_SIZE_TARGET / 1048576.0))
+    ap.add_argument("--map-bsp", help="the map's own compiled Source .bsp. Its texture lights "
+                    "(lights.rad: fluorescent tubes, light panels) exist only there; their faces "
+                    "become q3map_surfacelight copies (<map>_texlights.json -> vmt2shader.py "
+                    "--texlights). Without it those rooms are lit by light entities only.")
     ap.add_argument("--md3-dir", help="the converted models folder (models_fixed/, step 3's output). "
                     "Read to plan the prop budget; reduced-detail copies of models "
                     "(<name>_simp1.md3 / _simp2.md3) are written here when the plan needs them.")
@@ -11216,6 +11756,14 @@ def main():
                 "out of the water's fog - idTech3 fogs a whole model whose bounds touch the "
                 "fog volume, Source only what is seen through the water (shaders: "
                 "<map>_nofog_shaders.json -> vmt2shader.py --nofog-shaders).".format(n_wet, n_dry)]
+        map_text, n_fixtures = unshadow_light_fixtures(map_text, args.md3_dir)
+        if n_fixtures:
+            budget_report = list(budget_report or []) + [
+                "Light fixtures: {} baked prop(s) have a light entity inside them (lanterns, lamps) "
+                "and got \"_castShadows\" \"0\", so their light reaches the room the way it "
+                "does in CS:S instead of stopping at the prop's own glass; their shaders are "
+                "remapped to _lit copies ({} shader(s), <map>_lit_shaders.json) so their glass "
+                "glows the way the lit prop does in CS:S.".format(n_fixtures, len(LIT_SHADER_TARGETS))]
         report_baked_prop_geometry(map_text, args.md3_dir)
         if budget_report:
             print("\n" + "\n".join(budget_report), file=sys.stderr)
@@ -11307,11 +11855,35 @@ def main():
               "that density cannot be followed face by face.)".format(
                   coarse, src_lm * 1.9, max(lm_counts), lm_ss), file=sys.stderr)
 
+    TEXLIGHT_SHADERS.clear()
+    if args.map_bsp:
+        texlights, tl_note = read_source_texlights(args.map_bsp)
+        if texlights:
+            map_text, tl_report = emit_texture_lights(map_text, texlights, args.scale)
+            print("\nTexture lights (lights.rad, read from {}): rooms Source lights with glowing "
+                  "textures instead of light entities. Each becomes a q3map_surfacelight copy of "
+                  "its shader, at the same exposure as the point lights{}:\n  {}".format(
+                      os.path.basename(args.map_bsp), "; " + tl_note if tl_note else "",
+                      "\n  ".join(tl_report)), file=sys.stderr)
+        else:
+            print("\nTexture lights: none taken from {} ({}).".format(
+                os.path.basename(args.map_bsp), tl_note or "it has none"), file=sys.stderr)
+
     map_text = strip_source_prop_keys(map_text)
     with open(args.output, 'w', encoding='utf-8') as f:
         f.write(map_text)
 
     print("Wrote {}".format(args.output), file=sys.stderr)
+
+    # Written on every run, empty without texture lights, so a stale list never
+    # survives a reconversion.
+    tl_path = os.path.splitext(args.output)[0] + '_texlights.json'
+    with open(tl_path, 'w', encoding='utf-8') as f:
+        json.dump(TEXLIGHT_SHADERS, f, indent=1, sort_keys=True)
+
+    lit_path = os.path.splitext(args.output)[0] + '_lit_shaders.json'
+    with open(lit_path, 'w', encoding='utf-8') as f:
+        json.dump(LIT_SHADER_TARGETS, f, indent=1, sort_keys=True)
 
     nofog_path = os.path.splitext(args.output)[0] + '_nofog_shaders.json'
     with open(nofog_path, 'w', encoding='utf-8') as f:

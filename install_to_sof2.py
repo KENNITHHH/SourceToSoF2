@@ -285,6 +285,15 @@ def write_compile_bat(base, name, shader_file, out_dir=None, q3map2_path=None, r
         print("  NOTE: {} has no -gridscale, so it is left off the -light line - players and "
               "networked props will read a bit darker than the brushwork.".format(q3map2),
               file=sys.stderr)
+    if q3map2 and '-brightness' in light:
+        data = q3map2_strings(q3map2)
+        lacking = [f for f in ('-brightness', '-vertexscale')
+                   if data is not None and f.encode('ascii') not in data]
+        if lacking:
+            print("  WARNING: {} does not know {}. The converted map's lights carry headroom "
+                  "(vmt2shader LIGHT_HEADROOM) that those options take back out; without them the "
+                  "lighting comes out several times too bright. Compile with NetRadiant's "
+                  "q3map2.".format(q3map2, " / ".join(lacking)), file=sys.stderr)
     build_name, growable = q3map2_build(q3map2) if q3map2 else (None, None)
     fixed_lumps = growable is False
     bits = q3map2_bitness(q3map2) if q3map2 else None
@@ -421,8 +430,14 @@ def write_compile_bat(base, name, shader_file, out_dir=None, q3map2_path=None, r
         '-samples 2 -threads %NUMBER_OF_PROCESSORS% -v "%MAP%.bsp" || goto fail'.format(light),
     ] + tail
     # Same build for testing: -vis -fast (no full portal flow - minutes instead of
-    # hours, everything still drawn, just less culled) and no -bounce.
-    quick_light = re.sub(r'\s*-bounce\s+\d+', '', light)
+    # hours, everything still drawn, just less culled). The -bounce STAYS: the
+    # map's worldspawn ambient is solved together with it (vmt2shader.py
+    # BOUNCE_FILL), so a test build without it was lit darker than the real one -
+    # measured on de_cbble against CS:S's own lightmaps, its interiors came out at
+    # half. The quick build has to look like the release build or it can't be
+    # used to judge lighting. (Props have q3map_bounceScale 0, so the bounce
+    # costs seconds on de_cbble, not the hours it once did on de_mirage_cs2.)
+    quick_light = light
     quick = head + [
         '"%Q3MAP2%" -game sof2 -fs_basepath "%GAMEROOT%" -vis -fast -saveprt -v "%MAP%.bsp" || goto fail',
     ] + rem_ss + [
@@ -432,7 +447,7 @@ def write_compile_bat(base, name, shader_file, out_dir=None, q3map2_path=None, r
     quick_path = os.path.join(maps_dir, 'compile_{}_quick.bat'.format(name))
     with open(quick_path, 'w', newline='\r\n') as f:
         f.write('\n'.join(quick) + '\n')
-    print("  wrote {} (test build: -vis -fast, no -bounce)".format(os.path.relpath(quick_path, base)))
+    print("  wrote {} (test build: -vis -fast, same lighting)".format(os.path.relpath(quick_path, base)))
     path = os.path.join(maps_dir, 'compile_{}.bat'.format(name))
     with open(path, 'w', newline='\r\n') as f:
         f.write('\n'.join(lines) + '\n')

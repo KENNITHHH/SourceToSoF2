@@ -143,7 +143,7 @@ def script_search_dirs():
 # The run log is named after the program itself: SourceToSoF2.exe writes
 # SourceToSoF2.txt next to it (a renamed .exe follows its own name).
 APP_NAME = "SourceToSoF2"
-APP_VERSION = "1.0.0"      # bump for every release: shown in the title and every log
+APP_VERSION = "1.1.0"      # bump for every release: shown in the title and every log
 RUN_LOG_NAME = (os.path.splitext(os.path.basename(sys.executable))[0]
                 if getattr(sys, 'frozen', False) else APP_NAME) + ".txt"
 
@@ -633,6 +633,11 @@ def build_steps():
             args += ["--lightmap-samplesize", str(p.lightmap_samplesize).strip()]
         if os.path.isdir(p.models_fixed_dir):
             args += ["--md3-dir", p.models_fixed_dir]
+        # The map's own .bsp holds its texture lights (lights.rad), which the
+        # .vmf does not: without it, rooms lit only by glowing tubes stay dark.
+        bsp = p.map_bsp or find_map_bsp(p.vmf_path, p.sources_arg)[0]
+        if bsp:
+            args += ["--map-bsp", bsp]
         if p.full_quality:
             # Every prop at Source's own full detail: no simplified copies,
             # nothing dropped. The log still says how big the .bsp will be.
@@ -657,6 +662,12 @@ def build_steps():
             args += ["--overlay-mesh-materials", p.overlay_mesh_json]
         if os.path.isfile(p.nonsolid_json):
             args += ["--nonsolid-materials", p.nonsolid_json]
+        tl_json = os.path.join(p.output_dir, p.map_name + "_texlights.json")
+        if os.path.isfile(tl_json):
+            args += ["--texlights", tl_json]
+        lit_json = os.path.join(p.output_dir, p.map_name + "_lit_shaders.json")
+        if os.path.isfile(lit_json):
+            args += ["--lit-shaders", lit_json]
         nofog_json = os.path.join(p.output_dir, p.map_name + "_nofog_shaders.json")
         if os.path.isfile(nofog_json):
             args += ["--nofog-shaders", nofog_json]

@@ -8,7 +8,7 @@ sounds. One window, ten steps, one button.
 Tested on Counter-Strike: Source maps and CS:GO maps decompiled to `.vmf`
 (de_dust2, de_cache, de_overpass, de_mirage, de_cbble), for SoF2 MP 1.03.
 
-### [Download SourceToSoF2.exe](https://github.com/KENNITHHH/sourcetosof2/releases)
+### [Download SourceToSoF2.exe](https://github.com/KENNITHHH/SourceToSoF2/releases)
 
 One file, nothing to install. Windows 10/11 64-bit.
 
@@ -23,6 +23,7 @@ One file, nothing to install. Windows 10/11 64-bit.
 | **Windows** | 64-bit Windows 10 or 11. |
 | **The map** | The map's `.vmf`. For a map you only have as `.bsp`, decompile it with [BSPSource](https://github.com/ata4/bspsrc) first. |
 | **Source content** | Your Counter-Strike: Source install (or its `cstrike` folder), or folders/`.vpk` files the map's materials and models come from. If the map packs its own content into its `.bsp`, keep that `.bsp` next to the `.vmf` or under the content folder - the tool finds it and reads it first. |
+| **The map's own `.bsp`** | Recommended. Besides packed content, it holds the map's **texture lights** (fluorescent tubes, light panels, lamps that glow by their texture), which exist only in the compiled `.bsp`, not in the `.vmf`. Without it, rooms lit only that way stay dark. The GUI shows whether it found one. |
 | **Soldier of Fortune II** | A SoF2 install with its `base` folder. A separate copy for mapping is a good idea. |
 | **q3map2** | **NetRadiant's `q3map2.exe`** (it has SoF2 support). Use this one: see below. |
 
@@ -43,7 +44,7 @@ You do **not** need Python or anything else installed - it is all inside the `.e
 3. Leave all ten steps ticked and press **Run Selected Steps**.
 4. When it says **Done**, open `base\maps\` and run **`compile_<map>.bat`**
    (or `compile_<map>_quick.bat` for a fast test build: less visibility culling,
-   no light bounce).
+   same lighting as the full build).
 5. Start SoF2 and `\devmap <map>`.
 
 The compile also writes **`<map>_release.pk3`** into your output folder: the
@@ -79,6 +80,10 @@ safe_malloc failed on allocation of 224919552 bytes
 ```
 
 That is the address space of a 32-bit program, not your RAM.
+
+The compile also passes `-brightness`, `-vertexscale` and `-gridscale` values
+worked out for each map (see **Lighting** below). NetRadiant's q3map2 has all
+three; a build without them lights the map several times too bright.
 
 The tool checks the `q3map2.exe` you pick and says so before it runs, and the
 compile `.bat` prints the same note. You can keep editing in whichever Radiant
@@ -136,6 +141,16 @@ block went from 54 MB to 393 MB.
 - **Game logic:** Source's entity I/O (buttons, triggers, timers wired to each
   other) has no SoF2 equivalent and is not converted. Bomb sites and buy zones
   are not converted either.
+- **Lighting:** matched to the lighting Valve baked into the CS:S map, from
+  the map's own `light_environment` and lights, and from its texture lights when
+  the `.bsp` is there. Measured against Valve's lightmaps, de_dust2 comes out at
+  1.00 in sunlight, shade and lamp-lit areas. Two things CS:S does on top are
+  not reproduced: its HDR tonemapping and bloom, which make sunlight look a
+  little punchier with HDR on (`mat_hdr_level 0` in CS:S shows the look that is
+  matched), and per-pixel bump/specular. Compiles take longer than a plain
+  q3map2 compile: q3map2 normally cuts dim light off at its edges, and the
+  converted map is set up so that it does not (de_dust2: 484 s -> 666 s on 16
+  threads). The bounce pass of big prop-heavy maps takes longest.
 - **Several converted maps side by side:** shaders for shared CS textures come
   out identical from every map, so one map cannot spoil another's look.
 
@@ -159,6 +174,12 @@ window's output if it was the compile that failed.
   so there is less geometry.
 - **"safe_malloc failed on allocation of ... bytes"** - your q3map2 is 32-bit.
   Use a 64-bit one (see above).
+- **The map is lit several times too bright, or the .bat warns that q3map2
+  "does not know -brightness"** - the q3map2 you used is not NetRadiant's. Use
+  NetRadiant's q3map2 (see above).
+- **A room that is lit in CS:S is dark** - check the GUI found the map's own
+  `.bsp` (the "Map's own .bsp" line): rooms lit by glowing textures need it.
+  Then run the steps again.
 - **The compile .bat cannot find q3map2** - set the `q3map2.exe` field and run
   step 10 again, or edit the `Q3MAP2` line at the top of the `.bat`.
 - **"MAX_SHADER_INFO exceeded" in the compile** - q3map2 can load 8192 shaders

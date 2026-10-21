@@ -1098,6 +1098,39 @@ def skylight_floor_response(iterations=SKYLIGHT_ITERATIONS):
     return total / count
 
 
+# --- Light headroom ------------------------------------------------------------
+#
+# q3map2 gives every entity and surface light its "Fast" flag (light.cpp:
+# LightFlags::DefaultQ3A, whatever the command line says) and then drops, luxel
+# by luxel, any contribution of <= 1.0 (on its 0-255 linear scale) before
+# -gamma. At -gamma 2.2 a dropped 1.0 would have shown as 20/255, so every
+# light ends in a hard cut instead of VRAD's soft tail. Measured with this
+# q3map2: a light whose floor should read 15.9 reads 0; at 21 and up it is
+# exact. On de_dust2 the tunnel lamps (brightness ~50) are cut off about 150
+# Source units out - their pools never reach the floor, which is why the
+# tunnels read 0.57-0.74 of CS:S while sunlit sand is at 0.94.
+#
+# The cure is exact, not a boost: every light (k) is made LIGHT_HEADROOM times
+# stronger, and the compile undoes it - -brightness X^(-1/G) after gamma for
+# lightmaps (gamma is a power, so (X*L)^(1/G) * X^(-1/G) = L^(1/G)),
+# -vertexscale 1/X and -gridscale / X before it for vertex light and the light
+# grid. Per-shader q3map_lightmapBrightness / q3map_vertexScale multiply those
+# defaults, so no shared shader changes. What stays cut is <= 1/X: at 16 that
+# is 6.5/255 after gamma, against 20 now (16 recovers 0.96 of the lost light
+# on de_dust2, 64 would give 1.00 for twice the light reach and compile time).
+LIGHT_HEADROOM = 16.0
+
+# The worldspawn "ambient" stood in for bounce light that q3map2 lost: until
+# LIGHT_HEADROOM, its cutoff dropped most of the bounce pass's dim diffuse
+# lights, so k * BOUNCE_FILL was added as a flat floor. With the headroom the
+# real bounce arrives and the floor counted twice: measured against Valve's
+# lightmaps (luxel by luxel, the fill taken back out), dim interiors on
+# de_dust2 went 1.46 -> 1.11 and dark corners 4.91 -> 2.11 with no fill at all,
+# sunlit and lamp-lit unchanged; de_cbble 1.33 -> 1.24 and 2.00 -> 1.55.
+# BOUNCE_FILL stays as the solve's anchor for Source's bounce level.
+AMBIENT_FILL = 0.0
+
+
 def solve_exposure(sun_rgb, sun_brightness, amb_rgb, amb_brightness, elevation):
     """Return the q3map2 values - and the -gamma to compile with - that put this
     light_environment on SOF2's screen as close to CS:S as SOF2 can show.
@@ -1137,7 +1170,8 @@ def solve_exposure(sun_rgb, sun_brightness, amb_rgb, amb_brightness, elevation):
         c = target / (m_sun ** p)
     gamma = SOURCE_GAMMA / p
     O = float(ENGINE_LIGHTMAP_OVERBRIGHT * SHADER_LIGHTMAP_SCALE)
-    k = (c / O) ** gamma           # q3map2 value = k * Source linear (255 units)
+    # q3map2 value = k * Source linear (255 units), with the light headroom in it
+    k = (c / O) ** gamma * LIGHT_HEADROOM
     s_peak = max(S + [1e-9])
     a_peak = max(A + [1e-9])
     screen = lambda lin255: min(max_m, c * (max(lin255, 0.0) / 255.0) ** (p / SOURCE_GAMMA))
@@ -1147,14 +1181,17 @@ def solve_exposure(sun_rgb, sun_brightness, amb_rgb, amb_brightness, elevation):
         # the light grid lights players and model_static props with SOF2's normal
         # 1x shaders, so it must not carry the shaders' 2x: scaling it up by
         # SHADER^gamma before gamma (q3map2 -gridscale) puts it back on 1x.
-        'grid_scale': round(float(SHADER_LIGHTMAP_SCALE) ** gamma, 2),
+        'grid_scale': round(float(SHADER_LIGHTMAP_SCALE) ** gamma / LIGHT_HEADROOM, 4),
+        # undo LIGHT_HEADROOM: after gamma for lightmaps, before it for vertices
+        'brightness': round(LIGHT_HEADROOM ** (-1.0 / gamma), 5),
+        'vertex_scale': round(1.0 / LIGHT_HEADROOM, 5),
         'curve_p': p,
         'exact': p >= 0.999 and c >= 0.999,
         'sun_intensity': k * s_peak,
         'sun_color': [x / s_peak for x in S],
         'skylight_value': k * a_peak / skylight_floor_response(),
         'sky_color': [x / a_peak for x in A],
-        'bounce_fill': k * a_peak * BOUNCE_FILL,
+        'bounce_fill': k * a_peak * BOUNCE_FILL * AMBIENT_FILL,
         # on-screen multipliers of the texture - same scale as the CS:S measurement
         'predicted': {
             'sunlit floor': screen(_luminance(S) * incidence + _luminance(A) * (1 + BOUNCE_FILL)),
@@ -1247,6 +1284,8 @@ def parse_light_environment(vmf_path):
             'exposure_k': sol['k'],
             'compile_gamma': sol['compile_gamma'],
             'grid_scale': sol['grid_scale'],
+            'brightness': sol['brightness'],
+            'vertex_scale': sol['vertex_scale'],
             'source_levels': sol['source'],
             'predicted': sol['predicted'],
             # Unrounded, so --light-scale rounds ONCE at the end.
@@ -1304,8 +1343,11 @@ def generate_sky_shaders(sky_materials, sun_data=None):
             sl = sun_data['source_levels']
             lines.append("\t// Source light_environment, converted in linear space (VRAD's own")
             lines.append("\t// pow 2.2), k = {:.5f}.  COMPILE: -bsp ... -rename   -light ... -gamma {:g}"
-                         " -gridscale {:g} -bounce 1".format(sun_data['exposure_k'], sun_data['compile_gamma'],
-                                                   sun_data['grid_scale']))
+                         " -gridscale {:g} -brightness {:g} -vertexscale {:g} -bounce 1".format(
+                             sun_data['exposure_k'], sun_data['compile_gamma'], sun_data['grid_scale'],
+                             sun_data['brightness'], sun_data['vertex_scale']))
+            lines.append("\t// (-brightness / -vertexscale undo the x{:g} light headroom that keeps q3map2 from"
+                         " cutting dim light off - see LIGHT_HEADROOM)".format(LIGHT_HEADROOM))
             lines.append("\t// (-gridscale is netradiant-only; GtkRadiant 1.6's q3map2 lacks it and players"
                          " will read darker)")
             lines.append("\t// On screen (x texture), SOF2 vs CS:S: sunlit {:.2f}/{:.2f}  shade "
@@ -2538,6 +2580,26 @@ def _needs_vertex_compile(elems):
     return any(_stage_has(v, r'^\s*rgbGen\s+(exact)?vertex\b') for v in stages)
 
 
+# NOT q3map_vertexScale. Tried and measured, 2026-10-21: baked props were
+# thought to be too dark because their vertex colours (11-32/255) were
+# compared with a LIGHTMAPPED surface's vertex colours - which are never drawn.
+# Compared properly - each prop vertex against the lightmap of the wall right
+# beside it - they were already at parity: 0.95 on de_dust2, 1.07 on de_cbble.
+# q3map_vertexScale acts before -gamma, so 4.59 became 4.59^(1/2.2) = 2.0x on
+# screen: window frames and dust2's wall-top teeth glowed white. Baked props and
+# lightmaps are lit by the same q3map2 pass and need no correction between them.
+VERTEX_LIGHT_SCALE = [None]
+
+
+def set_vertex_light_scale(sun_data):
+    """Kept as a no-op so callers stay valid; see the note above."""
+    VERTEX_LIGHT_SCALE[0] = None
+
+
+def _vertex_scale_lines():
+    return []
+
+
 def _ensure_vertex_compile(elems):
     """SOF2 only has real vertex colours on surfaces q3map2 compiled as
     vertex-lit. A surface that also got a lightmap draws rgbGen vertex as
@@ -2554,7 +2616,8 @@ def _ensure_vertex_compile(elems):
     header = [(k, v) for k, v in elems if k == 'line' and not re.match(
         r'^\s*(q3map_nolightmap|q3map_onlyvertexlighting|q3map_lightmapsamplesize)\b', v.strip(), re.I)]
     rest = [(k, v) for k, v in elems if k != 'line']
-    return header + [('line', '\tq3map_nolightmap'), ('line', '\tq3map_onlyvertexlighting')] + rest
+    return header + [('line', '\tq3map_nolightmap'),
+                     ('line', '\tq3map_onlyvertexlighting')] + _vertex_scale_lines() + rest
 
 
 def _prop_bsp_form(elems):
@@ -2568,7 +2631,7 @@ def _prop_bsp_form(elems):
     # props' 435,891 triangles each became a bounce light (505,104 in all)
     # and the bounce pass ran for hours.
     out = header + [('line', '\tq3map_nolightmap'), ('line', '\tq3map_onlyvertexlighting'),
-                    ('line', '\tq3map_bounceScale 0')]
+                    ('line', '\tq3map_bounceScale 0')] + _vertex_scale_lines()
     if not stages:
         return out
     first = _stage_set(stages[0], 'rgbGen', 'vertex')
@@ -2722,6 +2785,109 @@ def nonsolid_copies(shader_text, names):
     return out, missing
 
 
+def _is_glowing_part(elems):
+    """Which surfaces of a lit prop glow: its glass. Source's surfaceprop glass
+    is what q3map_material Glass is made from; a lantern's panes and a lamp's
+    shade carry it, the iron frame around them doesn't."""
+    return any(k == 'line' and re.match(r'^\s*q3map_material\s+glass\b', v, re.I)
+               for k, v in elems)
+
+
+def _glow_stage(elems):
+    stages = [v for k, v in elems if k == 'stage']
+    img = None
+    for st in stages:
+        for l in st:
+            m = re.match(r'^\s*(?:map|clampmap)\s+(\S+)', l, re.I)
+            if m and not m.group(1).startswith('$'):
+                img = m.group(1)
+                break
+        if img:
+            break
+    if not img:
+        return None
+    return ('stage', ['\t\tmap {}'.format(img), '\t\tblendFunc GL_ONE GL_ONE',
+                      '\t\trgbGen identity',
+                      '\t\t// lit: a light sits inside this prop (vmf2map unshadow_light_fixtures)'])
+
+
+def lit_copies(shader_text, targets):
+    """<target> and <target>_bsp copies for the shaders of props that have a
+    light inside them (vmf2map.py remaps those placements' shaders to
+    <name>_lit, see unshadow_light_fixtures). The glass ones get one extra
+    stage that adds the texture again, unlit - the same thing SOF2's own lit
+    models do with a _glow stage (models/objects/hongkong/paper_lanterns). The
+    rest are plain copies, so a lantern's frame stays iron.
+    Returns (blocks, n_glowing, names with nothing to copy)."""
+    items = _split_shader_text(shader_text)
+    have = {it[1].lower(): it for it in items if it[0] == 'shader'}
+    out, missing, glowing = [], [], 0
+    for name, target in sorted(targets.items()):
+        base = re.sub(r'\.(tga|jpg|jpeg|png)$', '', name.strip(), flags=re.I)
+        made = False
+        for suffix in ('', '_bsp'):
+            if (target + suffix).lower() in have:
+                made = True
+                continue
+            src = have.get((base + suffix).lower())
+            if src is None:
+                continue
+            elems = list(src[2])
+            if _is_glowing_part(elems):
+                g = _glow_stage(elems)
+                if g:
+                    elems.append(g)
+                    if suffix == '_bsp':
+                        glowing += 1
+            out.append(_join_shader(target + suffix, elems))
+            made = True
+        if not made:
+            missing.append(base)
+    return out, glowing, missing
+
+
+_TEXLIGHT_DROP = re.compile(
+    r'^\s*(q3map_surfacelight|q3map_lightrgb|q3map_backsplash|q3map_lightimage|'
+    r'surfaceparm\s+nolightmap)\b', re.I)
+
+
+def texlight_copies(shader_text, specs):
+    """The emitting copies of Source texture lights (vmf2map.py
+    emit_texture_lights, <map>_texlights.json: {copy: {base, surfacelight,
+    rgb}}). Source makes such a face an area light AND draws it fullbright with
+    no lightmap (SURF_LIGHT | SURF_NOLIGHT), so the copy is the base shader's
+    header plus q3map_surfacelight / q3map_lightRGB (q3map2 would otherwise
+    take the colour from the image), q3map_backsplash 0 0 (VRAD has no
+    backsplash, and the value was calibrated without it), surfaceparm
+    nolightmap, and one stage drawing the texture as it is.
+    Returns (blocks, names with nothing to copy)."""
+    items = _split_shader_text(shader_text)
+    have = {it[1].lower(): it for it in items if it[0] == 'shader'}
+    out, missing = [], []
+    for name, spec in sorted(specs.items()):
+        if name.lower() in have:
+            continue
+        src = have.get(str(spec.get('base', '')).lower())
+        img = None
+        if src is not None:
+            g = _glow_stage(src[2])
+            img = g[1][0].split(None, 1)[1] if g else None
+        if src is None or not img:
+            missing.append(spec.get('base', name))
+            continue
+        head = [e for e in src[2] if e[0] == 'line' and not _TEXLIGHT_DROP.match(e[1])]
+        rgb = spec.get('rgb') or [1.0, 1.0, 1.0]
+        head += [('line', '\tq3map_surfacelight {:g}'.format(float(spec['surfacelight']))),
+                 ('line', '\tq3map_lightRGB {:g} {:g} {:g}'.format(*rgb)),
+                 ('line', '\tq3map_backsplash 0 0'),
+                 ('line', '\tsurfaceparm nolightmap'),
+                 ('line', '\t// texture light from the Source .bsp (vmf2map emit_texture_lights)')]
+        out.append(_join_shader(name, head + [('stage', ['\t\tmap {}'.format(img),
+                                                         '\t\trgbGen identity'])]))
+        have[name.lower()] = ('shader', name, head)
+    return out, missing
+
+
 def nofog_copies(shader_text, targets):
     """vmf2map.py remaps the shaders of a baked prop that stands mostly out of
     a water volume to <target> (misc_model "_remap"); q3map2 -rename then looks
@@ -2779,6 +2945,7 @@ def missing_bsp_twins(shader_text, md3_names, textures_root=None):
             '\t// generated for -rename: an .md3 names this shader but no _bsp form existed',
             '\tqer_editorimage {}'.format(img),
             '\tq3map_nolightmap', '\tq3map_onlyvertexlighting', '\tq3map_bounceScale 0',
+        ] + [v for _k, v in _vertex_scale_lines()] + [
             '\t{', '\t\tmap {}'.format(img), '\t\trgbGen vertex', '\t}',
             '\t{', '\t\tmap {}'.format(img), '\t\trgbGen vertex', '\t\tblendFunc GL_ONE GL_ONE',
             '\t\t// same stage again, added: SOF2 clamps vertex colour at 1.0x, this is the 2x',
@@ -3069,6 +3236,12 @@ def main():
                     help="the converted textures/ folder (step 2's output). Images whose path is "
                          "too long for idTech3 get a short-named copy made in it. Default: "
                          "'textures' next to the output .shader, which is where the GUI puts it.")
+    ap.add_argument("--texlights", help="the '<mapname>_texlights.json' vmf2map.py writes: "
+                    "emitting copies of the map's Source texture lights (q3map_surfacelight, "
+                    "fullbright), made from the shaders they copy.")
+    ap.add_argument("--lit-shaders", help="the '<mapname>_lit_shaders.json' vmf2map.py writes: "
+                    "shaders of props that have a light inside them, remapped to <name>_lit. "
+                    "Copies are made, with a glow stage on the glass ones.")
     ap.add_argument("--terrain-lwo-shaders", help="the '<mapname>_terrain_lwo_shaders.json' file "
                                                    "vmf2map.py writes alongside its output when "
                                                    "--terrain-mode lwo is used. Maps each welded "
@@ -3178,6 +3351,8 @@ def main():
                 sun_data['surfacelight_override'] = max(0.0, args.sky_light)
             sun_data['deviance'] = max(0.0, args.sun_deviance)
             sun_data['sun_samples'] = max(1, args.sun_samples)
+            # baked props are vertex lit, so they never see -gridscale
+            set_vertex_light_scale(sun_data)
             print("Found light_environment in {}: sun _light {:g} {:g} {:g} brightness {:g}, "
                   "_ambient brightness {}".format(
                       args.vmf, sun_data['r'], sun_data['g'], sun_data['b'],
@@ -3196,9 +3371,10 @@ def main():
                                                      pr['open wall in shadow'], pr['covered room']),
                   file=sys.stderr)
             print("     !! compile: -bsp ... -rename, then bsp_fix_leafbounds.py on the .bsp, then "
-                  "-light ... -gamma {:g} -gridscale {:g} -bounce 1 "
-                  "(derived for this map; -gridscale is netradiant-only) !!".format(
-                      sun_data['compile_gamma'], sun_data['grid_scale']), file=sys.stderr)
+                  "-light ... -gamma {:g} -gridscale {:g} -brightness {:g} -vertexscale {:g} -bounce 1 "
+                  "(derived for this map; needs netradiant's q3map2) !!".format(
+                      sun_data['compile_gamma'], sun_data['grid_scale'], sun_data['brightness'],
+                      sun_data['vertex_scale']), file=sys.stderr)
             print("NOTE: elevation is a direct, confirmed conversion of Source's pitch "
                   "convention. degrees (the compass direction) is best-effort - check the "
                   "sun's direction in-game against the original map's shadows and flip it "
@@ -3283,6 +3459,29 @@ def main():
                       "also override another converted map's correct one): {}".format(
                           len(MISSING_TWIN_SKIPPED), ", ".join(MISSING_TWIN_SKIPPED[:20]) +
                           (" ..." if len(MISSING_TWIN_SKIPPED) > 20 else "")), file=sys.stderr)
+        if args.lit_shaders and os.path.isfile(args.lit_shaders):
+            with open(args.lit_shaders, encoding='utf-8') as lf:
+                lit_targets = json.load(lf)
+            extra, n_glow, lit_missing = lit_copies(final_text, lit_targets)
+            if extra:
+                final_text += '\n\n' + '\n\n'.join(extra) + '\n'
+            if lit_targets:
+                print("Added {} lit shader copies for props with a light inside them (lanterns, "
+                      "lamps); {} of them glass, given a glow stage{}".format(
+                          len(extra), n_glow,
+                          "; nothing to copy for: " + ", ".join(lit_missing) if lit_missing else ""),
+                      file=sys.stderr)
+        if args.texlights and os.path.isfile(args.texlights):
+            with open(args.texlights, encoding='utf-8') as tf:
+                tl_specs = json.load(tf)
+            extra, tl_missing = texlight_copies(final_text, tl_specs)
+            if extra:
+                final_text += '\n\n' + '\n\n'.join(extra) + '\n'
+            if tl_specs:
+                print("Added {} texture-light shader(s) (Source lights.rad faces: "
+                      "q3map_surfacelight, drawn fullbright){}".format(
+                          len(extra), "; nothing to copy for: " + ", ".join(tl_missing)
+                          if tl_missing else ""), file=sys.stderr)
         if args.nofog_shaders and os.path.isfile(args.nofog_shaders):
             with open(args.nofog_shaders, encoding='utf-8') as nff:
                 nf_targets = json.load(nff)
