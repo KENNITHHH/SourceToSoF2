@@ -3637,6 +3637,42 @@ def terrain_scale_key(u_scale, v_scale):
     return '{:.4f}x{:.4f}'.format(u_scale, v_scale).replace('.', '_').replace('-', 'n')
 
 
+# The longest shader name DERIVED from a terrain base is
+# "textures/<base>.vertex" - the shared reference shader every worldspawn
+# vertexremapshader points at ("_0to1" is shorter). q3map2 and the engine both
+# BUILD those names from the base, so the base has to leave room for the
+# suffix: otherwise vmt2shader.py's MAX_QPATH pass renames the generated
+# shader to a hashed name while the .map keeps the long one, and the terrain
+# draws the missing-shader grid in game. Measured on de_cbble in patch mode:
+# "textures/de_cbble/grassdirt_blend/terrain_0_2500x0_2500.vertex" is 62
+# characters against the 59 the engine allows, so .vertex and _0to1 were
+# renamed in the .shader and nothing matched any more.
+TERRAIN_NAME_SUFFIX_ROOM = len('.vertex')
+
+# The placeholder shader the terrain's own faces carry. q3map2 swaps it for the
+# real _0/_1/_0to1 shaders while compiling, keying ONLY on q3map_indexed in the
+# shader plus the entity's alphamap - never on the name - so each terrain
+# material gets its own, carrying that material's ground texture as its editor
+# image (vmt2shader.py writes it). SOF2's own tools/_terrain works too, it just
+# shows the flat tool texture in Radiant, which is hard to edit landscape
+# against. KEEP IDENTICAL to vmt2shader.py's copy.
+# NOT a dotted suffix: q3map2 looks a shader up through PathExtensionless()
+# (shaders.cpp ShaderInfoForShader), so "<base>.edit" would be stripped back to
+# "<base>" - an undefined name, which silently loses q3map_indexed and leaves
+# the raw placeholder in the .bsp. Measured in a test compile before this was
+# an underscore.
+TERRAIN_FACE_SUFFIX = '_edit'
+
+
+def terrain_base_shader_name(material, u_scale, v_scale):
+    """The shared terrain shader base for a WorldVertexTransition
+    displacement, short enough that every name derived from it still fits."""
+    raw = (material.strip().lower().replace('\\', '/') + '/terrain_' +
+           terrain_scale_key(u_scale, v_scale))
+    full = short_qpath('textures/' + raw, QPATH_NAME_MAX - TERRAIN_NAME_SUFFIX_ROOM)
+    return full[len('textures/'):]
+
+
 def build_displacement_terrain(side, all_sides, texture_map, unmapped_counter,
                                 scale, offset, warnings, material):
     """Build a func_group 'terrain' entity for a WorldVertexTransition
@@ -3671,8 +3707,7 @@ def build_displacement_terrain(side, all_sides, texture_map, unmapped_counter,
     # gets its own, separate per-displacement uniqueness via side_id,
     # since that part genuinely must never be shared (confirmed critical
     # bug, fixed earlier).
-    base_shader_name = (material.strip().lower().replace('\\', '/') + '/terrain_' +
-                         terrain_scale_key(u_scale, v_scale))
+    base_shader_name = terrain_base_shader_name(material, u_scale, v_scale)
     num_layers = 2
 
     poly = get_face_polygon(side, all_sides)
@@ -3753,7 +3788,7 @@ def build_displacement_terrain(side, all_sides, texture_map, unmapped_counter,
             return "( {:.10g} {:.10g} {:.10g} ) ( {:.10g} {:.10g} {:.10g} ) ( {:.10g} {:.10g} {:.10g} ) {} 0 0 0 0.500000 0.500000 {} 0 0".format(
                 a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2], tex, CF)
 
-        lines.append(side_line(p1, p2, p3, "tools/_terrain"))
+        lines.append(side_line(p1, p2, p3, base_shader_name + TERRAIN_FACE_SUFFIX))
         lines.append(side_line(b1, b3, b2, "tools/_caulk"))       # bottom (reversed winding)
         lines.append(side_line(p1, b1, b2, "tools/_caulk"))       # side 1-2
         lines.append(side_line(p2, b2, b3, "tools/_caulk"))       # side 2-3
@@ -3841,8 +3876,7 @@ def build_displacement_terrain_patch(side, all_sides, texture_map, unmapped_coun
     # and build_displacement_terrain's own matching comment (confirmed
     # necessary: MAX_SPAWN_CHARS on worldspawn once made unique regardless
     # of scale).
-    base_shader_name = (material.strip().lower().replace('\\', '/') + '/terrain_' +
-                         terrain_scale_key(u_scale, v_scale))
+    base_shader_name = terrain_base_shader_name(material, u_scale, v_scale)
     num_layers = 2
 
     poly = get_face_polygon(side, all_sides)
@@ -3908,7 +3942,8 @@ def build_displacement_terrain_patch(side, all_sides, texture_map, unmapped_coun
     # Winding fix for the visible geometry.
     grid_points = grid_points[::-1]
 
-    patch_lines = ["{", "patchDef2", "{", "tools/_terrain", "( {} {} 0 0 0 )".format(n, n), "("]
+    patch_lines = ["{", "patchDef2", "{", base_shader_name + TERRAIN_FACE_SUFFIX,
+                   "( {} {} 0 0 0 )".format(n, n), "("]
     for row in grid_points:
         row_str = " ".join(
             "( {:.10g} {:.10g} {:.10g} {:.10g} {:.10g} )".format(p[0], p[1], p[2], u, v)
@@ -5720,11 +5755,14 @@ DEFAULT_TOOL_TEXTURES = {
     # SOF2's file, which is exactly why faces get remapped to these names
     # rather than having vmt2shader.py invent duplicate definitions under
     # the Source names.
-    "TOOLS/TOOLSNODRAW": "tools/_caulk",
-    # Source's nodraw is SOLID + invisible. SOF2's own _nodraw declares
-    # "surfaceparm nonsolid", so it is NOT the right target - _caulk
-    # (nodraw + nolightmap + nomarks, no nonsolid) is the solid one.
-    "TOOLS/TOOLSINVISIBLE": "tools/_caulk",
+    # Source's nodraw is SOLID + invisible, and it casts NO shadow: VBSP
+    # deletes nodraw faces outright (de_cbble: 0 of 8954 faces are nodraw) and
+    # VRAD only traces faces. SOF2's own _nodraw is "surfaceparm nonsolid", so
+    # it is not the target either, and tools/_caulk - the solid one - blocks
+    # light. vmf2map/nodraw (vmt2shader.py) is caulk plus "surfaceparm trans":
+    # solid, invisible, and transparent to light, like Source's.
+    "TOOLS/TOOLSNODRAW": "vmf2map/nodraw",
+    "TOOLS/TOOLSINVISIBLE": "vmf2map/nodraw",
     "TOOLS/TOOLSTRIGGER": "tools/_trigger",
     "TOOLS/TOOLSHINT": "tools/_hint",
     # NOT SOF2's tools/_skip: that shader has no "surfaceparm skip", so q3map2
@@ -6152,6 +6190,11 @@ def solve_brush_vertices(planes):
 # structural brush, solid or not, so these still seal exactly as before but
 # no longer collide.
 TERRAIN_BASE_TEXTURE = 'vmf2map/terrain_base'
+
+# Source's nodraw/invisible: solid but transparent to light, like VRAD's (the
+# faces do not exist in a compiled Source .bsp, so nothing traces them).
+# Only ever used on DETAIL brushes - see convert_solid.
+NODRAW_LIGHT_TEXTURE = 'vmf2map/nodraw'
 TERRAIN_BASE_SOLIDS = set()
 TERRAIN_BASE_MIN_COVERAGE = 0.95
 _NODRAW_TOOL_MATERIALS = {'TOOLS/TOOLSNODRAW', 'TOOLS/TOOLSINVISIBLE'}
@@ -6540,6 +6583,17 @@ def convert_solid(solid, texture_map, unmapped_counter, scale, offset, warnings,
     if get1(solid, 'id') in TERRAIN_BASE_SOLIDS:
         for s in out_sides:
             s['texture'] = TERRAIN_BASE_TEXTURE
+
+    if not detail:
+        # vmf2map/nodraw lets light through (see NODRAW_LIGHT_TEXTURE), and a
+        # brush q3map2 can see through seals nothing: a structural brush made
+        # of it leaks. Structural is exactly what seals, so those keep
+        # tools/_caulk and go on blocking light; the detail brushes - which is
+        # what Source's invisible volumes come out as, and the only ones that
+        # ever caused a wrong shadow - get the see-through one.
+        for s in out_sides:
+            if s['texture'] == NODRAW_LIGHT_TEXTURE:
+                s['texture'] = 'tools/_caulk'
     lines = ["{"]
     for s in out_sides:
         lines.append(format_side(s, detail))
@@ -8362,6 +8416,7 @@ NONSOLID_MATERIALS = set()       # 'textures/<material>' whose _nonsolid copy is
 # always emits for each. Every other tool/helper shader is already non-solid
 # (or a clip, which a never-solid entity doesn't carry) and is left alone.
 _NONSOLID_TOOL_SWAP = {'tools/_caulk': 'vmf2map/nodraw_nonsolid',
+                       'vmf2map/nodraw': 'vmf2map/nodraw_nonsolid',
                        'tools/_black': 'vmf2map/black_nonsolid'}
 _P3 = r'\(\s*[-+\d.eE]+\s+[-+\d.eE]+\s+[-+\d.eE]+\s*\)'
 _BRUSH_FACE_TEX_RE = re.compile(r'^(\s*' + _P3 + r'\s*' + _P3 + r'\s*' + _P3 + r'\s+)(\S+)(.*)$')

@@ -143,7 +143,7 @@ def script_search_dirs():
 # The run log is named after the program itself: SourceToSoF2.exe writes
 # SourceToSoF2.txt next to it (a renamed .exe follows its own name).
 APP_NAME = "SourceToSoF2"
-APP_VERSION = "1.1.0"      # bump for every release: shown in the title and every log
+APP_VERSION = "1.1.1"      # bump for every release: shown in the title and every log
 RUN_LOG_NAME = (os.path.splitext(os.path.basename(sys.executable))[0]
                 if getattr(sys, 'frozen', False) else APP_NAME) + ".txt"
 

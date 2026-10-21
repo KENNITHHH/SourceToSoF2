@@ -1586,6 +1586,15 @@ def convert_vmt_to_shader(rel_path, shader_class, body, surfaceprop_map,
     return emit_dual_shader_blocks(rel_path, lines)
 
 
+# KEEP IDENTICAL to vmf2map.py's copy.
+# NOT a dotted suffix: q3map2 looks a shader up through PathExtensionless()
+# (shaders.cpp ShaderInfoForShader), so "<base>.edit" would be stripped back to
+# "<base>" - an undefined name, which silently loses q3map_indexed and leaves
+# the raw placeholder in the .bsp. Measured in a test compile before this was
+# an underscore.
+TERRAIN_FACE_SUFFIX = '_edit'
+
+
 def convert_worldvertextransition_to_terrain_shaders(rel_path, body, surfaceprop_map,
                                                        unmapped_surfaceprops, material_map,
                                                        unmapped_materials, warnings,
@@ -1747,6 +1756,27 @@ def convert_worldvertextransition_to_terrain_shaders(rel_path, body, surfaceprop
         terrain_vertex.append(tcmod0)
     terrain_vertex += ['\t}'] + terrain_lightmap_stage() + ['}']
     blocks.append('\n'.join(terrain_vertex))
+
+    # The placeholder the terrain's own faces carry in the .map, which q3map2
+    # replaces with the three shaders above while compiling (vmf2map.py's
+    # build_displacement_terrain / _patch write it). SOF2's tools/_terrain did
+    # this job, and still would - the ONLY thing q3map2 keys on is
+    # q3map_indexed on the face's shader plus the entity's alphamap
+    # (surface.cpp: "si->indexed && im != nullptr"), nothing looks at the name.
+    # Giving each terrain material its own placeholder, with the ground texture
+    # as its editor image, means the landscape looks like ground in Radiant
+    # instead of the flat tool texture, which is what you want when editing it
+    # by hand. Verified with a real compile: a terrain entity whose patch
+    # carries this shader still comes out as the _0/_1/_0to1 triplet.
+    terrain_edit = [base_shader_name + TERRAIN_FACE_SUFFIX, '{']
+    terrain_edit.append('\tqer_editorimage {}'.format(map0))
+    terrain_edit.append('\tq3map_indexed')
+    terrain_edit.extend(common_header())
+    terrain_edit += ['\t{', '\t\tmap {}'.format(map0), terrain_rgbgen()]
+    if tcmod0:
+        terrain_edit.append(tcmod0)
+    terrain_edit += ['\t}'] + terrain_lightmap_stage() + ['}']
+    blocks.append('\n'.join(terrain_edit))
 
     return blocks
 
@@ -2065,11 +2095,14 @@ def convert_directory(materials_dir, surfaceprop_map, material_map, sun_data=Non
     # terrain is built on to this (see its scan_terrain_base_slabs). nodraw +
     # nonsolid but NOT trans: q3map2 seals with any opaque structural brush,
     # so these still seal the map, they just no longer collide.
+    # No qer_trans: the slabs draw SOLID in the editor. They are what the
+    # displacement terrain sits on, and a see-through one is awkward to pick
+    # and move when editing the landscape by hand. Editor-only keyword; the
+    # compile and the game are unaffected.
     shader_blocks.append("\n".join([
         "textures/vmf2map/terrain_base",
         "{",
         "\tqer_editorimage textures/tools/_caulk",
-        "\tqer_trans 0.35",
         "\tsurfaceparm nodraw",
         "\tsurfaceparm nonsolid",
         "\tsurfaceparm nolightmap",
@@ -2097,6 +2130,32 @@ def convert_directory(materials_dir, surfaceprop_map, material_map, sun_data=Non
     # tools/_caulk and tools/_black are both solid, and contents in idTech3
     # come from the shader alone (q3map2 ORs every side's contents into the
     # brush, so one solid face makes the whole brush solid).
+    # Always emitted: Source's nodraw, which vmf2map.py maps here. It is
+    # SOLID and invisible, and VBSP DELETES its faces - de_cbble's compiled
+    # .bsp has 8954 faces and not one of them is toolsnodraw. VRAD casts
+    # shadows by tracing faces, so a nodraw brush casts no shadow in Source,
+    # in the world or in a brush entity. SOF2's tools/_caulk does block light
+    # (q3map2 SetupBrushes: a brush is opaque unless one of its sides is
+    # C_TRANSLUCENT), which turned invisible Source volumes into hard black
+    # patches - on de_cbble a nodraw func_breakable over the long roof left a
+    # 640 x 240 unit band of wall and trim pitch black where CS:S has it
+    # sunlit. "surfaceparm trans" clears that one flag: light passes, the
+    # contents stay solid so players and bullets still stop, and the faces are
+    # still never drawn. These brushes come out as detail, so vis and sealing
+    # are unchanged. tools/_caulk stays as it is for the map's own seal box,
+    # and Source's toolsblocklight still maps to it - that one is meant to
+    # block light.
+    shader_blocks.append("\n".join([
+        "textures/vmf2map/nodraw",
+        "{",
+        "\tqer_editorimage textures/tools/_caulk",
+        "\tqer_trans 0.35",
+        "\tsurfaceparm nodraw",
+        "\tsurfaceparm nolightmap",
+        "\tsurfaceparm nomarks",
+        "\tsurfaceparm trans",
+        "}",
+    ]))
     shader_blocks.append("\n".join([
         "textures/vmf2map/nodraw_nonsolid",
         "{",
